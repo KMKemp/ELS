@@ -1,0 +1,1212 @@
+---
+title: 'EARLY LIFE STRESS IN MICE ALTERS GUT MICROBIOTA INDEPENDENT OF MATERNAL MICROBIOTA'
+author: "Keri Kemp"
+date: "11/20/2020"
+output:
+  html_document: default
+  fig_crop: no
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Raw Data
+The original sequencing reads are available for download via NCBI’s Sequence Read Archive under Bioproject PRJNA605008.
+
+``````{r message=FALSE}
+
+# Set working directory and file paths 
+setwd("~/Box/Kemp_MSEW_2020/new_analysis/R_analysis")
+base_dir <- '~/Box/Kemp_MSEW_2020/new_analysis/R_analysis'
+
+#Load libraries
+library(phyloseq)
+library(genefilter)
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+library(compositions)
+library(zCompositions)
+library(CoDaSeq)
+library(vegan)
+library(btools)
+library(rcompanion)
+library(lme4)
+library(lmerTest)
+library(knitr)
+library(kableExtra)
+```
+
+## Import the data into phyloseq
+```{r}
+# Create phyloseq object from otu and taxonomy tables from dada2, along with the sample metadata.
+otu <- read.table("_bin/silva_otu_table2.txt",sep="\t",header=TRUE, row.names=1)
+taxon <- read.table("_bin/silva_taxa_table2.txt",sep="\t",header=TRUE,row.names=1)
+samples<-read.table("_bin/mapping_file2.txt",sep="\t",header=T,row.names=1)
+fitGTR <- readRDS("_bin/fitGTR.rds")
+OTU = otu_table(otu, taxa_are_rows=FALSE)
+taxon<-as.matrix(taxon)
+TAX = tax_table(taxon)
+ps <- phyloseq(otu_table(otu, taxa_are_rows=FALSE), 
+               sample_data(samples), 
+               tax_table(taxon),phy_tree(fitGTR$tree))
+ps
+
+# add a DNAStringSet object (to be accessed by the refseq function) to keep track of the ASV sequences
+sequences <- Biostrings::DNAStringSet(taxa_names(ps))
+names(sequences) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, sequences)
+ps
+
+# rename our ASVs to something more convenient in downstream analysis, while automatically retaining the corresponding unique sequence identifier
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+# remove chloroplasts, mitochondria, and Eukaryota
+ntaxa(ps) #1631
+ps <- subset_taxa(ps, Kingdom !="NA")
+ntaxa(ps) #1607; 24 removed
+ps <- subset_taxa(ps, Family !="Mitochondria")
+ntaxa(ps) #1578; 29 removed
+ps <- subset_taxa(ps, Order !="Chloroplast")
+ntaxa(ps) #1570; 8 removed
+
+sum(sample_sums(ps)) #10235191 #10235177
+
+# filter very low abundance ASVs
+ntaxa(ps) #1576
+ps2<-filter_taxa(ps, function(x) mean(x) >5, TRUE)
+ntaxa(ps2) #370
+sum(sample_sums(ps2)) #10196018
+
+# mean, max and min of sample read counts
+min(sample_sums(ps2)) 
+mean(sample_sums(ps2))
+max(sample_sums(ps2)) 
+
+# add read count
+reads_sample <- microbiome::readcount(ps2)
+sample_data(ps2)$reads_sample <- reads_sample
+sample_data(ps2)
+
+# remove samples with less than 3,000 reads
+ps2 =subset_samples(ps2, reads_sample >3000)
+min <- min(sample_sums(ps2))
+sample_data(ps2) 
+```
+
+## Now export otu and taxa tables from phyloseq for codaseq
+```{r}
+otu = as(otu_table(ps2), "matrix")
+taxon = as(tax_table(ps2), "matrix")
+metadata = as(sample_data(ps2), "matrix")
+otu = as.data.frame(otu)
+alex.in <- otu
+taxon = as.data.frame(taxon)
+samples = as.data.frame(metadata) 
+```
+
+### Imput zero values and conduct the Aitchison center-log-ratio (CLR) transformation.
+```{r}
+# count number of zeros in the table
+sum(otu == 0) # 17110
+
+# Replace 0 values with an estimate (because normalization is taking log, can't have 0) using the Bayesian-multiplicative replacement function cmultRepl in Zcompositions. Also transposing here, because we need samples as rows.
+d.czm <- zCompositions::cmultRepl(t(otu), method="CZM", label=0)
+# No. corrected values:  1375
+
+# Perform the centred log-ratio, or CLR (Aitchison) transformation using CoDaSeq.  
+# The output will have the ASVs as columns the 69 samples as ROWS
+d.clr <- CoDaSeq::codaSeq.clr(d.czm) # No. corrected values:  15978 
+dim(d.clr) # 370  80
+
+# Distance matrix
+dist.clr <- dist(t(d.clr))
+dist_pairs <- spaa::dist2list(dist.clr)
+atch_pairs <- as.data.frame(dist_pairs)
+names(atch_pairs)[1] <- "DAM_sample"
+names(atch_pairs)[2] <- "SampleID"
+names(atch_pairs)[3] <- "Distance"
+
+```
+
+### Define the function: Make knitr table from Permanova results. https://rdrr.io/github/TBrach/MicrobiomeX/src/R/Functions.R
+```{r definition, echo = FALSE}
+get_permanova_table <- function(adonis) {
+  kable_table <- adonis[[1]]
+  kable_table[["Pr(>F)"]] <- format(kable_table[["Pr(>F)"]], digits = 3)
+  options(knitr.kable.NA = '') 
+  knitr::kable(kable_table,
+               digits = 3,
+               caption = "Permanova results") %>%
+  kable_styling(full_width = FALSE)
+}
+```
+
+```{r}
+get_permanova_table
+```
+
+### PD2 PERMANOVA
+```{r}
+############ PD2 PERMANOVA ############
+# Subset metadata to just PD2 samples
+pd2_samples <- samples %>%
+  dplyr::filter(PD == "PD2")
+
+# Make a list of PD2 sample names
+pd2_list <- pd2_samples %>%
+  pull(SampleID)  
+
+# Filter the d.clr object to just the 10 pd2 samples
+d.clr_pd2 <- subset(d.clr, select=pd2_list)
+dim(d.clr_pd2)
+
+# Permanova between groups using Aitchison distance
+dist.clr <- dist(t(d.clr_pd2))
+perm<-adonis(dist.clr~TREATMENT, pd2_samples, strata=pd2_samples$MOM, permutations=9999)
+get_permanova_table(perm)
+```
+
+### PD10 PERMANOVA
+```{r}
+############ PD10 PERMONOVA ############
+# Subset metadata to just PD10 samples
+pd10_samples <- samples %>%
+  dplyr::filter(PD == "PD10")
+
+# Make a list of PD10 sample names
+pd10_list <- pd10_samples %>%
+  pull(SampleID)  
+
+# Filter the d.clr object to just the pd10 samples
+d.clr_pd10 <- subset(d.clr, select=pd10_list)
+dim(d.clr_pd10)
+
+# Permanova between groups using Aitchison distance
+dist.clr <- dist(t(d.clr_pd10))
+perm<-adonis(dist.clr~TREATMENT, strata=pd10_samples$MOM, pd10_samples, permutations=9999)
+get_permanova_table(perm)
+```
+
+```{r}
+############ PERMDISP PD10 ############
+# Use betadisper to test for differences in dispersion of treatment groups at PD28
+# First define groups
+groups <- pd10_samples[["TREATMENT"]]
+
+# Calculate dispersion from centroid
+bdisp_PD10 <- betadisper(dist.clr , groups)
+
+# Extract distances 
+as.character(bdisp_PD10$group)->TREATMENT
+bdisp_PD10_df <- cbind.data.frame(TREATMENT,bdisp_PD28$distances) #make a dataframe
+bdisp_PD10_df <- add_rownames(bdisp_PD10_df, "SampleID") #make row names a column with the heading "SampleID"
+names(bdisp_PD10_df)[3]<-"Dispersion" #rename column
+
+dispersion_pd10_summary <- Rmisc::summarySE(bdisp_PD10_df, measurevar="Dispersion", groupvars=c("TREATMENT"))
+
+# Welch Two Sample t-test
+t.test(bdisp_PD10_df$Dispersion ~ bdisp_PD10_df$TREATMENT) 
+# Permutation test for homogeneity of multivariate dispersions
+permutest(bdisp_PD10, pairwise = FALSE, permutations=9999)
+```
+
+### PD28 PERMANOVA
+```{r}
+############ PD28 PERMANOVA ############
+# Subset metadata to just PD28 samples
+pd28_samples <- samples %>%
+  dplyr::filter(PD == "PD28")
+
+# Make a list of PD28 sample names
+pd28_list <- pd28_samples %>%
+  pull(SampleID)  
+
+# Filter the d.clr object to just the pd28 samples
+d.clr_pd28 <- subset(d.clr, select=pd28_list)
+dim(d.clr_pd28)
+
+# Distance matrix
+dist.clr <- dist(t(d.clr_pd28))
+# Permanova between groups using Aitchison distance
+perm<-adonis(dist.clr~TREATMENT, pd28_samples, strata=pd28_samples$MOM, permutations=9999)
+get_permanova_table(perm)
+```
+
+```{r}
+############ PERMDISP PD28 ############
+# Use betadisper to test for differences in dispersion of treatment groups at PD28
+# First define groups
+groups <- pd28_samples[["TREATMENT"]]
+
+# Calculate dispersion from centroid
+bdisp_PD28 <- betadisper(dist.clr , groups)
+
+# Extract distances 
+as.character(bdisp_PD28$group)->TREATMENT
+bdisp_PD28_df <- cbind.data.frame(TREATMENT,bdisp_PD28$distances) #make a dataframe
+bdisp_PD28_df <- add_rownames(bdisp_PD28_df, "SampleID") #make row names a column with the heading "SampleID"
+names(bdisp_PD28_df)[3]<-"Dispersion" #rename column
+
+dispersion_pd28_summary <- Rmisc::summarySE(bdisp_PD28_df, measurevar="Dispersion", groupvars=c("TREATMENT"))
+dispersion_pd28_summary
+
+# Welch Two Sample t-test
+t.test(bdisp_PD28_df$Dispersion ~ bdisp_PD28_df$TREATMENT) 
+# Permutation test for homogeneity of multivariate dispersions
+permutest(bdisp_PD28, pairwise = FALSE, permutations=9999)
+```
+
+### PD28 PCA
+```{r, fig.align='center', out.width="60%"}
+############ PD28 PCA ############
+# Samples must be ROWs and features/ASVs as COLUMNS. Use the prcomp included in the R core statistics.
+# plot compositional PCA biplot (perform a singular value decomposition)
+d.pcx <- prcomp(t(d.clr_pd28))
+# calculate percent variance explained for the axis labels
+pc1 <- round((d.pcx$sdev[1]^2/sum(d.pcx$sdev^2))*100,1)
+pc2 <- round((d.pcx$sdev[2]^2/sum(d.pcx$sdev^2))*100,1)
+xlab <- paste("PC1: ", pc1, "%", sep="")
+ylab <- paste("PC2: ", pc2, "%", sep="")
+
+#extract NMDS scores
+scrs_PD28 <- scores(d.pcx)
+scrs_PD28 <- as.data.frame(scrs_PD28) %>%
+  dplyr::select(PC1,PC2)
+#To facilitate computing centroids, add Treatment as a variable to the data frame of scores
+scrs_PD28 <- cbind(as.data.frame(scrs_PD28), Treatment = pd28_samples$TREATMENT)
+# Now compute the group centroids, which are the mean coordinate on each axis, groupwise:
+cent_PD28 <- aggregate(cbind(PC1, PC2) ~ Treatment, data = scrs_PD28, FUN = mean)
+# To draw the spider, we need to use geom_segment() which requires coordiates to draw 
+# the segment from and to. Our to coordinates, the xend and yend aesthetics will be 
+# the centroids. So we need to replicate the group centroid for each observation in 
+# the group. This we facilitate by a left join via merge:
+segs_PD28 <- merge(scrs_PD28, setNames(cent_PD28, c('Treatment','oPC1','oPC2')),
+                   by = 'Treatment', sort = FALSE)
+
+# set colors
+cols = c("Control" = "black", "MSEW" = "red")
+
+# "spider" plot PCA with ggplot2
+pd28_pca<-ggplot(scrs_PD28, aes(x = PC1, y = PC2, colour = Treatment)) +
+  geom_segment(data = segs_PD28,
+               mapping = aes(xend = oPC1, yend = oPC2)) + # spiders
+  geom_point(data = cent_PD28, size = 4, shape = 21, fill= "white", show.legend = F) +                    
+  coord_equal() +
+  scale_colour_manual(values = c("Control" = "black", "MSEW" = "red")) +
+  geom_point(aes(color = Treatment), size = 2, shape = 19)+
+  theme_bw()+
+  labs(color="TREATMENT",x=xlab, y=ylab) +
+  theme(aspect.ratio = 1, # set plot to square
+        panel.background = element_blank(), 
+        panel.grid.major = element_blank(),  #remove major-grid labels
+        panel.grid.minor = element_blank(),  #remove minor-grid labels
+        plot.background = element_blank(),
+        plot.margin = unit(c(0, 0, 2, 0), "cm"),
+        text = element_text(size=16),axis.text.x=element_text(size=14))
+# Add 95% confidence interval
+pd28_pca <- pd28_pca + 
+  stat_ellipse(linetype = 2)
+pd28_pca
+```
+
+### Dam PERMANOVA
+```{r}
+############ Dams PERMANOVA ############
+# Subset metadata to just dam samples
+dam_samples <- samples %>%
+  dplyr::filter(PD == "Dam")
+
+# Make a list of Dam sample names
+dam_list <- dam_samples %>%
+  pull(SampleID)  
+
+# Filter the d.clr object to just the dam samples
+d.clr_dams <- subset(d.clr, select=dam_list)
+dim(d.clr_dams)
+
+# Permanova between groups using Aitchison distance.
+dist.clr <- dist(t(d.clr_dams))
+perm<-adonis(dist.clr~TREATMENT, dam_samples,  strata=dam_samples$MOM, permutations=9999)
+get_permanova_table(perm)
+```
+
+### Dam PCA
+```{r, fig.align='center', out.width="60%"}
+############ Dams PCA ############
+# Samples must be ROWs and features/ASVs as COLUMNS. Use the prcomp included in the R core statistics.
+# plot compositional PCA biplot (perform a singular value decomposition)
+d.pcx <- prcomp(t(d.clr_dams))
+# calculate percent variance explained for the axis labels
+pc1 <- round((d.pcx$sdev[1]^2/sum(d.pcx$sdev^2))*100,1)
+pc2 <- round((d.pcx$sdev[2]^2/sum(d.pcx$sdev^2))*100,1)
+xlab <- paste("PC1: ", pc1, "%", sep="")
+ylab <- paste("PC2: ", pc2, "%", sep="")
+
+#extract NMDS scores
+scrs_dams <- scores(d.pcx)
+scrs_dams <- as.data.frame(scrs_dams) %>%
+  dplyr::select(PC1,PC2)
+#To facilitate computing centroids, add Treatment as a variable to the data frame of scores
+scrs_dams <- cbind(as.data.frame(scrs_dams), Treatment = dam_samples$TREATMENT)
+# Now compute the group centroids, which are the mean coordinate on each axis, groupwise:
+cent_dams <- aggregate(cbind(PC1, PC2) ~ Treatment, data = scrs_dams, FUN = mean)
+# To draw the spider, we need to use geom_segment() which requires coordiates to draw 
+# the segment from and to. Our to coordinates, the xend and yend aesthetics will be 
+# the centroids. So we need to replicate the group centroid for each observation in 
+# the group. This we facilitate by a left join via merge:
+segs_dams <- merge(scrs_dams, setNames(cent_dams, c('Treatment','oPC1','oPC2')),
+                   by = 'Treatment', sort = FALSE)
+
+# set colors
+cols = c("Control" = "grey", "MSEW" = "#A32CC4")
+
+# "spider" plot PCA with ggplot2
+dams_pca<-ggplot(scrs_dams, aes(x = PC1, y = PC2, colour = Treatment)) +
+  geom_segment(data = segs_dams,
+               mapping = aes(xend = oPC1, yend = oPC2)) + # spiders
+  geom_point(data = cent_dams, size = 4, shape = 21, fill= "white", show.legend = F) +                    
+  coord_equal() +
+  scale_colour_manual(values = c("Control" = "darkgray", "MSEW" = "#A32CC4")) +
+  geom_point(aes(color = Treatment), size = 2, shape = 19)+
+  theme_bw()+
+  labs(color="TREATMENT",x=xlab, y=ylab) +
+  theme(aspect.ratio = 1, # set plot to square
+        panel.background = element_blank(), 
+        panel.grid.major = element_blank(),  #remove major-grid labels
+        panel.grid.minor = element_blank(),  #remove minor-grid labels
+        plot.background = element_blank(),
+        plot.margin = unit(c(0, 0, 2, 0), "cm"),
+        text = element_text(size=16),axis.text.x=element_text(size=14))
+# Add 95% confidence interval
+dams_pca <- dams_pca + 
+  stat_ellipse(linetype = 2)
+dams_pca
+```
+
+### Alpha Diversity
+```{r}
+######################################### 
+############ Alpha diversity ############
+######################################### 
+
+# Rarefy to account for differences in sequencing depth among samples. Trim OTUs from the dataset that are no longer observed in any sample (have a count of zero in every sample).
+set.seed(310)
+ELS_R = rarefy_even_depth(ps2, sample.size = 3200, replace = FALSE, trimOTUs = TRUE)
+# Species Richness (se.chao1 = standard error of mean)
+Chao1<-estimate_richness(ELS_R, measures=c("Chao1"))
+Chao1$SampleID <- rownames(Chao1)
+Chao1$SampleID<-chartr(old = ".", new = "-", Chao1$SampleID)
+# Faith's Phylogenetic Diversity (SR = observed species richness)
+FaithsPD<-btools::estimate_pd(ELS_R)
+colnames(FaithsPD)[1] <-"Faiths_PD"
+FaithsPD$SampleID <- rownames(FaithsPD)
+# merge tables
+alpha_div <- full_join(Chao1,FaithsPD, by = "SampleID")
+alpha_div <- alpha_div[,c(3,5,1,2,4)]
+# add metadata
+metadata <- get_variable(ELS_R)
+alpha_div <- full_join(alpha_div,metadata, by = "SampleID")
+# write out file
+write.csv(alpha_div,"alpha_div_3200.csv")
+
+# summarize for stats and plotting
+alpha_div$MOM <- as.factor(alpha_div$MOM)
+fpd <- Rmisc::summarySE(alpha_div, measurevar="Faiths_PD", groupvars=c("PD","TREATMENT"))
+chao <- Rmisc::summarySE(alpha_div, measurevar="Chao1", groupvars=c("PD","TREATMENT"))
+
+# Subset for stats and plotting
+PD2_adiv  <- subset(alpha_div,PD == "PD2" )
+PD10_adiv  <- subset(alpha_div,PD == "PD10" )
+PD28_adiv  <- subset(alpha_div,PD == "PD28" )
+Dam_adiv  <- subset(alpha_div,PD == "Dam" & MOM != "dam_14") # exclude dam that had only one litter for paired tests
+
+# Dam 014 removed
+fpd2 <- Rmisc::summarySE(Dam_adiv, measurevar="Faiths_PD", groupvars=c("PD","TREATMENT"))
+chao2 <- Rmisc::summarySE(Dam_adiv, measurevar="Chao1", groupvars=c("PD","TREATMENT"))
+
+# write out file
+fpd2 <- rbind.data.frame(fpd2,fpd)
+chao2 <- rbind.data.frame(chao2,chao)
+write.csv(fpd2,"Faiths_PD_Summary.csv")
+write.csv(chao2,"Chao1_Summary.csv")
+```
+
+### PD28 Alpha Diversity Plots
+```{r}
+# subset summary statistics to PD28 for plotting
+PD28_fpd <- subset(fpd, PD == "PD28")
+PD28_chao <- subset(chao, PD == "PD28")
+# Set plotting theme & colors
+theme_set(theme_bw())
+cols = c("Control" = "black", "MSEW" = "red")
+
+# plot PD28 Faiths PD
+fpd28_p <- ggplot(PD28_adiv, aes(x=TREATMENT, y=Faiths_PD)) +
+  geom_errorbar(data=PD28_fpd, mapping = aes(x = TREATMENT, y = Faiths_PD, 
+              ymin = Faiths_PD - se, ymax = Faiths_PD + se), size=0.5, color="dimgrey", width=.5) +
+  geom_crossbar(data=PD28_fpd, aes(ymin = Faiths_PD, ymax = Faiths_PD),
+              size=0.4,col="dimgrey", width = .5) +
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.3, height=0), size = 2)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "Phylogenetic Diversity \n (Faith's PD)") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=16),axis.text.x=element_text(size=16)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(size=16,colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+fpd28_p  
+
+# plot PD28 Chao1
+chao28_p <- ggplot(PD28_adiv, aes(x=TREATMENT, y=Chao1)) +
+  geom_errorbar(data=PD28_chao, mapping = aes(x = TREATMENT, y = Chao1, 
+              ymin = Chao1 - se, ymax = Chao1 + se), size=0.5, color="dimgrey", width=.5) +
+  geom_crossbar(data=PD28_chao, aes(ymin = Chao1, ymax = Chao1),
+              size=0.4,col="dimgrey", width = .5) +
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.3, height=0), size = 2)+
+  scale_y_continuous(limits=c(120,240), breaks = seq(12, 240, by = 20))+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "ASV Richness \n  (Chao 1 Estimator)") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=16),axis.text.x=element_text(size=16)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(size=16,colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+chao28_p 
+# combine PD28 alpha diveristy plots
+theme_set(theme_bw())
+alpha28_p <- cowplot::plot_grid(chao28_p, fpd28_p, ncol = 2, align = "v")
+alpha28_p
+
+```
+
+### Dam Alpha Diversity Plots
+```{r}
+# subset summary statistics to Dams for plotting
+Dam_fpd <- subset(fpd, PD == "Dam")
+Dam_chao <- subset(chao, PD == "Dam")
+# Set plotting theme & colors
+theme_set(theme_bw())
+cols = c("Control" = "grey", "MSEW" = "#A32CC4")
+
+# plot dam Faiths PD
+fpdD_p <- ggplot(Dam_adiv, aes(x=TREATMENT, y=Faiths_PD)) +
+  geom_errorbar(data=Dam_fpd, mapping = aes(x = TREATMENT, y = Faiths_PD, 
+                                             ymin = Faiths_PD - se, ymax = Faiths_PD + se), size=0.5, color="dimgrey", width=.5) +
+  geom_crossbar(data=Dam_fpd, aes(ymin = Faiths_PD, ymax = Faiths_PD),
+                size=0.4,col="dimgrey", width = .5) +
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 2)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "Phylogenetic Diversity \n (Faith's PD)") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=16),axis.text.x=element_text(size=16)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(size=16,colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+fpdD_p  
+# plot dam Chao1
+chaoD_p <- ggplot(Dam_adiv, aes(x=TREATMENT, y=Chao1)) +
+  geom_errorbar(data=Dam_chao, mapping = aes(x = TREATMENT, y = Chao1, 
+                                              ymin = Chao1 - se, ymax = Chao1 + se), size=0.5, color="dimgrey", width=.5) +
+  geom_crossbar(data=Dam_chao, aes(ymin = Chao1, ymax = Chao1),
+                size=0.4,col="dimgrey", width = .5) +
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 2)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "ASV Richness \n (Chao 1 Estimator)") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=16),axis.text.x=element_text(size=16)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(size=16,colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+chaoD_p 
+
+# combine dam alpha diveristy plots
+theme_set(theme_bw())
+alphaDam_p <- cowplot::plot_grid(chaoD_p, fpdD_p, ncol = 2, align = "v")
+alphaDam_p
+```
+
+### Alpha Diversity Normality Tests
+```{r}
+# Histograms for Chao1
+# Create 2x2 plot environment  
+par(mfrow = c(3, 3))
+plotNormalHistogram(PD2_adiv$Chao1, main= "PD2 Chao1")
+plotNormalHistogram((PD10_adiv$Chao1),main= "PD10 Chao1")
+plotNormalHistogram(log(PD10_adiv$Chao1),main= "PD10 Chao1")
+plotNormalHistogram(PD28_adiv$Chao1, main= "PD28 Chao1")
+plotNormalHistogram(Dam_adiv$Chao1, main= "Dam Chao1")
+
+# Test for normality 
+shapiro.test(PD2_adiv$Chao1)
+shapiro.test(log(PD10_adiv$Chao1)) 
+shapiro.test(PD28_adiv$Chao1) 
+shapiro.test(Dam_adiv$Chao1) 
+
+# Histograms for Phylogenetic Diveristy 
+# Create 2x2 plot environment  
+par(mfrow = c(2, 2))
+plotNormalHistogram(log(PD2_adiv$Faiths_PD), main= "PD2 Faiths PD")
+plotNormalHistogram(PD10_adiv$Faiths_PD, main= "PD10 Faiths PD")
+plotNormalHistogram(PD28_adiv$Faiths_PD, main= "PD28 Faiths PD")
+plotNormalHistogram(Dam_adiv$Faiths_PD, main= "Dam Faiths PD")
+
+# Test for normality 
+shapiro.test((PD2_adiv$Faiths_PD)) 
+shapiro.test(log(PD2_adiv$Faiths_PD)) 
+shapiro.test(PD10_adiv$Faiths_PD)
+shapiro.test(PD28_adiv$Faiths_PD)
+shapiro.test(Dam_adiv$Faiths_PD) 
+# all normal
+```
+
+### GLM Dam Alpha Diversity
+```{r}
+############ Dam stats ############
+############ Dam Chao1 ############
+
+model = lmer(Dam_adiv$Chao1 ~ TREATMENT + (1|MOM) + (1|EXP), data=Dam_adiv)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Chao1 ANOVA table for dams") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(Dam_adiv$Chao1, main= "Dam Chao1")
+boxplot(Chao1 ~ TREATMENT, data = Dam_adiv)
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x, main= "Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+
+############ Dam Faith's PD ############
+
+model = lmer(Dam_adiv$Faiths_PD ~ TREATMENT + (1|MOM) + (1|EXP), data=Dam_adiv)
+summary(model)
+sstable <-anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Faith's PD ANOVA table for dams") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(Dam_adiv$Faiths_PD, main= "Dam Faith's PD")
+boxplot(Faiths_PD ~ TREATMENT, data = Dam_adiv)
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x, main= "Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+### GLM PD28 Alpha Diversity
+```{r}
+############ PD28 stats ############
+############ PD28 Chao1 ############
+model = lmer(PD28_adiv$Chao1 ~ TREATMENT * (1|MOM) , data=PD28_adiv)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Chao1 ANOVA table for PD28") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(PD28_adiv$Chao1, main="Chao1")
+boxplot(Chao1 ~ TREATMENT, data = PD28_adiv,
+        ylab="Chao1",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x,main= "Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+
+
+############ PD28 Faith's PD ############
+model = lmer(PD28_adiv$Faiths_PD ~ TREATMENT + (1|MOM), data=PD28_adiv)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Faith's PD ANOVA table for PD28") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(PD28_adiv$Faiths_PD, main= "PD28 Faiths PD")
+boxplot(Faiths_PD ~ TREATMENT, data = PD28_adiv,
+        ylab="Faiths_PD",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x, main= "Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+### GLM PD10 Alpha Diversity
+```{r}
+############ PD10stats #############
+############ PD10 Chao1 ############
+model = lmer(log(PD10_adiv$Chao1) ~ TREATMENT + (1|MOM), data=PD10_adiv)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Chao1 ANOVA table for PD10") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create 2x2 plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(log(PD10_adiv$Chao1), main= "PD10 Chao1")
+boxplot(log(Chao1) ~ TREATMENT, data = PD10_adiv,
+        ylab="Chao1",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x,  main= "Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+
+############ PD10 Faith's PD ############
+model = lmer(PD10_adiv$Faiths_PD ~ TREATMENT + (1|MOM), data=PD10_adiv)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Faith's PD table for PD10") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(log(PD10_adiv$Faiths_PD),main= "PD10 Faiths_PD")
+boxplot(Faiths_PD ~ TREATMENT, data = PD10_adiv,
+        ylab="Faiths_PD",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x, main="Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+### GLM PD2 Alpha Diversity
+```{r}
+############ PD2 stats ############
+############ PD2 Chao1 ############
+model = lmer(PD2_adiv$Chao1 ~ TREATMENT + (1|MOM), data=PD2_adiv)
+summary(model)
+sstable <-anova(model)
+sstable
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Chao1 ANOVA table for PD2") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create plot environment
+par(mfrow = c(3, 2))
+plotNormalHistogram(PD2_adiv$Chao1 , main= "PD2 Chao1")
+# plot data
+boxplot(Chao1 ~ TREATMENT, data = PD2_adiv,
+        ylab="Log trans. Chao1",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x, main= "Residuals")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+
+############ PD2 Faith's PD ############
+model = lmer(log(PD2_adiv$Faiths_PD) ~ TREATMENT + (1|MOM), data=PD2_adiv)
+summary(model)
+sstable <-anova(model, type=1)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Faith's PD ANOVA table for PD2") %>%
+  kable_styling(full_width = FALSE)
+
+# Create plot environment
+par(mfrow = c(3, 2))
+# plot data
+plotNormalHistogram(log(PD2_adiv$Faiths_PD), main= "PD2 Faith's PD")
+boxplot(Faiths_PD ~ TREATMENT, data = PD2_adiv,
+        ylab="Faiths_PD",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x, main= "Residules")
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+### Shared OTUs
+```{r}
+##################################################
+############ Shared OTUs with mothers ############
+##################################################
+# normalize to relative abundance based on rarefied data
+ELSnorm <- transform_sample_counts(ps2, function(x) x/sum(x ))
+# now extract the transformed OTU table into a dataframe for vizualizations
+ELSnorm_otu<-as.data.frame(t(otu_table(ELSnorm)))
+ELSnorm_otu$OTU<-row.names(ELSnorm_otu)
+
+# metadata
+metadata = as(sample_data(ELSnorm), "matrix")
+metadata = as.data.frame(metadata)
+```
+
+### PD28 Shared OTUs
+```{r}
+############ PD28 ############
+metadata_PD28 <- subset(metadata, PD == "PD28")
+# Create two vecotrs showing the variables you are interested in
+interest1 <- as.character(metadata_PD28$SampleID)
+interest2 <- as.character(metadata_PD28$DAM_sample)
+
+# Design a function to do the compare
+compare <- function(int1, int2, dat){
+  dat2 <- dat %>% 
+    dplyr::select(OTU, int1, int2) %>%
+    dplyr::filter(!!sym(int1) > 0 , !!sym(int2) > 0)%>%
+    dplyr::select(-int2)
+  return(dat2)
+}
+
+# Loop through interest1 and interest2
+shared_otus <- map2(interest1, interest2, compare, dat = ELSnorm_otu) %>%
+  purrr::reduce(full_join, by = "OTU")
+write.csv(shared_otus,"PD28_shared_ASVs_table.csv",row.names=FALSE)
+
+# get the count how many OTUs each pup shares with its mom
+sum_otu_counts <- as.data.frame(t(shared_otus %>%
+                                    dplyr::select(-c(`OTU`)) %>%  
+                                    summarise_all(funs(sum(!is.na(.))))))
+names(sum_otu_counts)[1] <- "Count"
+
+# get the total relative abundance of the OTUs each pup shares with its mom
+sum_otu_abund <- as.data.frame(shared_otus %>%
+                                 dplyr::select(-c(`OTU`)) %>%  
+                                 colSums(na.rm = TRUE)) 
+names(sum_otu_abund)[1] <- "Tot.Rel.Abund."
+
+# get metadata to attach to the summary tables
+variables <- as.data.frame(metadata %>%
+                             dplyr::filter(PD == "PD28") %>%
+                             dplyr::select(SampleID, PD, EXP, TREATMENT, LITTER, MOM, DAM_sample))
+
+# combine summary tables and attach metadata 
+PD28_shared_otus <- merge(as.data.frame(sum_otu_abund), as.data.frame(sum_otu_counts), by='row.names', all=TRUE)
+"SampleID" -> colnames(PD28_shared_otus)[1]
+PD28_shared_otus <- full_join(PD28_shared_otus,variables, by = "SampleID")
+PD28_shared_otus <- inner_join(atch_pairs,PD28_shared_otus, by = c("SampleID","DAM_sample"))
+# write out file
+write.csv(PD28_shared_otus,"PD28_shared_ASVs.csv",row.names=FALSE)
+```
+
+### PD10 Shared OTUs
+```{r}
+############ PD10 ############
+metadata_PD10 <- subset(metadata, PD == "PD10")
+# Create two vecotrs showing the variables you are interested in
+interest1 <- as.character(metadata_PD10$SampleID)
+interest2 <- as.character(metadata_PD10$DAM_sample)
+
+# Loop through interest1 and interest2
+shared_otus <- map2(interest1, interest2, compare, dat = ELSnorm_otu) %>%
+  purrr::reduce(full_join, by = "OTU")
+
+# get the count how many OTUs each pup shares with its mom
+sum_otu_counts <- as.data.frame(t(shared_otus %>%
+                                    dplyr::select(-c(`OTU`)) %>%  
+                                    summarise_all(funs(sum(!is.na(.))))))
+names(sum_otu_counts)[1] <- "Count"
+
+# get the total relative abundance of the OTUs each pup shares with its mom
+sum_otu_abund <- as.data.frame(shared_otus %>%
+                                 dplyr::select(-c(`OTU`)) %>%  
+                                 colSums(na.rm = TRUE)) 
+names(sum_otu_abund)[1] <- "Tot.Rel.Abund."
+
+# get metadata to attach to the summary tables
+variables <- as.data.frame(metadata %>%
+                             dplyr::filter(PD == "PD10") %>%
+                             dplyr::select(SampleID, PD, EXP, TREATMENT, LITTER, MOM, DAM_sample))
+                               
+
+# combine summary tables and attach metadata 
+PD10_shared_otus <- merge(as.data.frame(sum_otu_abund), as.data.frame(sum_otu_counts), by='row.names', all=TRUE)
+"SampleID" -> colnames(PD10_shared_otus)[1]
+PD10_shared_otus <- full_join(PD10_shared_otus,variables, by = "SampleID")
+PD10_shared_otus <- inner_join(atch_pairs,PD10_shared_otus, by = c("SampleID","DAM_sample"))
+# write out file
+write.csv(PD10_shared_otus,"PD10_shared_ASVs.csv", row.names=FALSE)
+```
+
+### Normality Tests for Shared OTUs
+```{r}
+################# normality and transformations #################
+# https://rcompanion.org/handbook/I_12.html
+# get metadata
+metadata = as(sample_data(ELSnorm), "matrix")
+metadata = as.data.frame(metadata)
+metadata$MOM = as.factor(metadata$MOM)
+metadata = subset(metadata, PD != "PD2")
+
+# summarize for stats and plotting
+sum_PD28RA <- Rmisc::summarySE(PD28_shared_otus, measurevar="Tot.Rel.Abund.", groupvars=c("TREATMENT"))
+sum_PD28count <- Rmisc::summarySE(PD28_shared_otus, measurevar="Count", groupvars=c("TREATMENT"))
+sum_PD28atch <- Rmisc::summarySE(PD28_shared_otus, measurevar="Distance", groupvars=c("TREATMENT"))
+sum_PD10RA <- Rmisc::summarySE(PD10_shared_otus, measurevar="Tot.Rel.Abund.", groupvars=c("TREATMENT"))
+sum_PD10count <- Rmisc::summarySE(PD10_shared_otus, measurevar="Count", groupvars=c("TREATMENT"))
+sum_PD10atch <- Rmisc::summarySE(PD10_shared_otus, measurevar="Distance", groupvars=c("TREATMENT"))
+# write out files
+write.csv(sum_PD28RA,"Shared_ASVs_PD28_RA_Summary.csv")
+write.csv(sum_PD28count,"Shared_ASVs_PD28_Count_Summary.csv")
+write.csv(sum_PD28atch,"Shared_ASVs_PD28_AtchDist_Summary.csv")
+write.csv(sum_PD10RA,"Shared_ASVs_PD10_RA_Summary.csv")
+write.csv(sum_PD10count,"Shared_ASVs_PD10_Count_Summary.csv")
+write.csv(sum_PD10atch,"Shared_ASVs_PD10_AtchDist_Summary.csv")
+
+# transform proportional data with the Arcsine transformation (http://strata.uga.edu/8370/rtips/proportions.html)
+PD10_shared_otus$PD10_RA_logit <-car::logit(PD10_shared_otus$Tot.Rel.Abund.)
+PD28_shared_otus$PD28_RA_logit <-car::logit(PD28_shared_otus$Tot.Rel.Abund.)
+
+par(mfrow = c(1, 2))
+plotNormalHistogram((PD10_shared_otus$Count), main= "PD10 Count")
+plotNormalHistogram((PD28_shared_otus$Count), main= "PD28 Count")
+
+par(mfrow = c(1, 2))
+plotNormalHistogram(PD10_shared_otus$PD10_RA_logit, main= "PD10 Logit Trans. Tot.Rel.Abund.")
+plotNormalHistogram(PD28_shared_otus$PD28_RA_logit, main= "PD28 Logit Trans. Tot.Rel.Abund.")
+# Logit looks better, use logit transformation
+
+par(mfrow = c(1, 2))
+plotNormalHistogram((PD10_shared_otus$Distance), main= "PD10 AtchDist")
+plotNormalHistogram(PD28_shared_otus$Distance, main= "PD28 AtchDist")
+
+# Test for normality 
+shapiro.test(PD28_shared_otus$PD28_RA_logit) 
+shapiro.test(PD10_shared_otus$PD10_RA_logit) 
+shapiro.test((PD28_shared_otus$Count))
+shapiro.test((PD10_shared_otus$Count))
+shapiro.test(PD28_shared_otus$Distance)
+shapiro.test(PD10_shared_otus$Distance)
+# all normal
+```
+
+### GLM PD10 Shared OTUs
+```{r}
+################# PD10 stats #################
+################# PD10 Atchison Dist ##################
+model = lmer((PD10_shared_otus$Distance) ~ TREATMENT + (1|MOM), data=PD10_shared_otus)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Aitchison Distance ANOVA table for PD10") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create 2x2 plot environment
+par(mfrow = c(2, 2))
+# plot data
+boxplot((Distance) ~ TREATMENT, data = PD10_shared_otus,
+        ylab="PD10",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x)
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+```{r}
+################# PD10 RA #################
+model = lmer(PD10_shared_otus$PD10_RA_logit ~ TREATMENT + (1|MOM), data=PD10_shared_otus)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 4, caption = "Relative Abundance ANOVA table for PD10") %>%
+  kable_styling(full_width = FALSE) 
+
+# Create 2x2 plot environment
+par(mfrow = c(2, 2))
+# plot data
+boxplot(PD10_RA_logit ~ TREATMENT, data = PD10_shared_otus,
+        ylab="PD10 Logit Trans. Tot. Rel. Abund.",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x)
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+
+```
+
+```{r}
+################# PD10 Count #################
+model = lmer((PD10_shared_otus$Count) ~ TREATMENT + (1|MOM), data=PD10_shared_otus)
+summary(model)
+sstable <- anova(model)
+
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Count ANOVA table for PD10") %>%
+  kable_styling(full_width = FALSE)
+
+# Create 2x2 plot environment
+par(mfrow = c(2, 2))
+# plot data
+boxplot(Count ~ TREATMENT, data = PD10_shared_otus,
+        ylab="PD10 Count",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x)
+# plot Q plot
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+
+```
+
+### GLM PD28 Shared OTUs
+```{r}
+################# PD28 stats #################
+################# PD28 Atch Dist ##################
+model = lmer(PD28_shared_otus$Distance ~ TREATMENT + (1|MOM), data=PD28_shared_otus)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Aitchison Distance ANOVA table for PD28") %>%
+  kable_styling(full_width = FALSE)
+
+
+# Create 2x2 plot environment
+par(mfrow = c(2, 2))
+# plot data
+boxplot(Distance ~ TREATMENT, data = PD28_shared_otus,
+        ylab="PD28 Aitchison",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x)
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+```{r}
+################# PD28 RA #################
+model = lmer(PD28_shared_otus$PD28_RA_logit ~ TREATMENT + (1|MOM), data=PD28_shared_otus)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 3, caption = "Relative Abundance ANOVA table for PD28") %>%
+  kable_styling(full_width = FALSE)
+
+# Create 2x2 plot environment
+par(mfrow = c(2, 3))
+# plot data
+boxplot(PD28_RA_logit ~ TREATMENT, data = PD28_shared_otus,
+        ylab="PD28 Arcsine Trans. Tot. Rel. Abund.",
+        xlab="Treatment")
+plotNormalHistogram(PD28_shared_otus$PD28_RA_logit)
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x)
+# normal probability plot 
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+```{r}
+################# PD28 Count #################
+model = lmer(PD28_shared_otus$Count ~ TREATMENT + (1|MOM), data=PD28_shared_otus)
+summary(model)
+sstable <- anova(model)
+
+# Creating an html ANOVA table 
+options(knitr.kable.NA = '') # this will hide missing values in the kable table
+kable(sstable, digits = 4, caption = "Count ANOVA table for PD28") %>%
+  kable_styling(full_width = FALSE)
+
+# Create 2x2 plot environment
+par(mfrow = c(2, 2))
+# plot data
+boxplot(Count ~ TREATMENT, data = PD28_shared_otus,
+        ylab="PD28 Count",
+        xlab="Treatment")
+# plot residules histogram
+x = (residuals(model))
+plotNormalHistogram(x)
+# plot Q plot
+qqnorm(residuals(model), ylab="Sample Quantiles for residuals")
+qqline(residuals(model), col="red")
+# simple scatterplot between residuals and predicted values. It should look more or less random.
+plot(fitted(model), residuals(model))
+```
+
+### Plot Shared OTUs
+```{r}
+# Set plotting theme & colors
+theme_set(theme_bw())
+cols = c("Control" = "black", "MSEW" = "red")
+
+# plot PD10 Count
+pd10_count <- ggplot(PD10_shared_otus, aes(x=TREATMENT, y=Count)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 1.5)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "No. of shared\nASVs") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=14),axis.text.x=element_text(size=12)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+pd10_count 
+
+# plot PD10 RA
+pd10_RA <- ggplot(PD10_shared_otus, aes(x=TREATMENT, y=Tot.Rel.Abund.)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 1.5)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "Total relative abundance\nof shared ASVs") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=14),axis.text.x=element_text(size=12)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+pd10_RA
+
+# plot PD10 Atch dist
+pd10_atch <- ggplot(PD10_shared_otus, aes(x=TREATMENT, y=Distance)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 1.5)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "Aitchison\nDistance") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=14),axis.text.x=element_text(size=12)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+pd10_atch
+
+# Set plotting theme & colors
+theme_set(theme_bw())
+cols = c("Control" = "black", "MSEW" = "red")
+
+# plot PD28 Count
+pd28_count <- ggplot(PD28_shared_otus, aes(x=TREATMENT, y=Count)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 1.5)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "No. of shared\nASVs") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=14),axis.text.x=element_text(size=12)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+pd28_count 
+
+# plot PD28 RA
+pd28_RA <- ggplot(PD28_shared_otus, aes(x=TREATMENT, y=Tot.Rel.Abund.)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 1.5)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "Total relative abundance\nof shared ASVs") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=14),axis.text.x=element_text(size=12)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+pd28_RA
+
+# plot PD28 Atc Dist
+pd28_atch <- ggplot(PD28_shared_otus, aes(x=TREATMENT, y=Distance)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(aes(colour = TREATMENT), 
+              position=position_jitter(width=0.1, height=0), size = 1.5)+
+  scale_colour_manual(values = cols) +
+  labs(x = " ",y = "Aitchison\nDistance") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(text = element_text(size=14),axis.text.x=element_text(size=12)) +
+  theme(legend.position="none") +
+  theme(axis.title.y=element_text(colour="black",margin = margin(t = 0, r = 10, b = 0, l = 0)))
+pd28_atch
+
+################# Figure all panels #################
+theme_set(theme_bw())
+shared_outs_p <- plot_grid(pd10_count, pd28_count, 
+                           pd10_RA, pd28_RA, 
+                           pd10_atch, pd28_atch, 
+                 ncol = 2, align = "hv")
+shared_outs_p 
+```
+
