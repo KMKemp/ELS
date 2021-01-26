@@ -16,7 +16,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ## Raw Data
 The original sequencing reads are available for download via NCBI’s Sequence Read Archive under Bioproject PRJNA605008.
 
-``````{r message=FALSE}
+```{r message=FALSE}
 
 # Set working directory and file paths 
 setwd("~/Box/Kemp_MSEW_2020/new_analysis/R_analysis")
@@ -43,9 +43,9 @@ library(kableExtra)
 ## Import the data into phyloseq
 ```{r}
 # Create phyloseq object from otu and taxonomy tables from dada2, along with the sample metadata.
-otu <- read.table("_bin/silva_otu_table2.txt",sep="\t",header=TRUE, row.names=1)
-taxon <- read.table("_bin/silva_taxa_table2.txt",sep="\t",header=TRUE,row.names=1)
-samples<-read.table("_bin/mapping_file2.txt",sep="\t",header=T,row.names=1)
+otu <- read.table("_bin/silva_otu_table.txt",sep="\t",header=TRUE, row.names=1)
+taxon <- read.table("_bin/silva_taxa_table.txt",sep="\t",header=TRUE,row.names=1)
+samples<-read.table("_bin/mapping_file.txt",sep="\t",header=T,row.names=1)
 fitGTR <- readRDS("_bin/fitGTR.rds")
 OTU = otu_table(otu, taxa_are_rows=FALSE)
 taxon<-as.matrix(taxon)
@@ -65,21 +65,16 @@ ps
 taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
 
 # remove chloroplasts, mitochondria, and Eukaryota
-ntaxa(ps) #1631
 ps <- subset_taxa(ps, Kingdom !="NA")
-ntaxa(ps) #1607; 24 removed
 ps <- subset_taxa(ps, Family !="Mitochondria")
-ntaxa(ps) #1578; 29 removed
 ps <- subset_taxa(ps, Order !="Chloroplast")
-ntaxa(ps) #1570; 8 removed
-
-sum(sample_sums(ps)) #10235191 #10235177
+sum(sample_sums(ps)) 
 
 # filter very low abundance ASVs
-ntaxa(ps) #1576
+ntaxa(ps)
 ps2<-filter_taxa(ps, function(x) mean(x) >5, TRUE)
-ntaxa(ps2) #370
-sum(sample_sums(ps2)) #10196018
+ntaxa(ps2)
+sum(sample_sums(ps2))
 
 # mean, max and min of sample read counts
 min(sample_sums(ps2)) 
@@ -111,7 +106,7 @@ samples = as.data.frame(metadata)
 ### Imput zero values and conduct the Aitchison center-log-ratio (CLR) transformation.
 ```{r}
 # count number of zeros in the table
-sum(otu == 0) # 17110
+sum(otu == 0) 
 
 # Replace 0 values with an estimate (because normalization is taking log, can't have 0) using the Bayesian-multiplicative replacement function cmultRepl in Zcompositions. Also transposing here, because we need samples as rows.
 d.czm <- zCompositions::cmultRepl(t(otu), method="CZM", label=0)
@@ -120,7 +115,7 @@ d.czm <- zCompositions::cmultRepl(t(otu), method="CZM", label=0)
 # Perform the centred log-ratio, or CLR (Aitchison) transformation using CoDaSeq.  
 # The output will have the ASVs as columns the 69 samples as ROWS
 d.clr <- CoDaSeq::codaSeq.clr(d.czm) # No. corrected values:  15978 
-dim(d.clr) # 370  80
+dim(d.clr) 
 
 # Distance matrix
 dist.clr <- dist(t(d.clr))
