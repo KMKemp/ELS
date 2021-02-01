@@ -4,6 +4,8 @@ EARLY LIFE STRESS IN MICE ALTERS GUT MICROBIOTA INDEPENDENT OF MATERNAL MICROBIO
 <h3>Description:</h3>
 <p>Exposure to early life stress (ELS) is linked to a greater risk of chronic disease development. Rodent models of early life neglect are used to characterize the mechanistic links between ELS and the risk of disease later in life. However, little is understood about ELS exposure and the gut microbiota in the young mice and the influence of the maternal inheritance of the gut microbiota. This studyused a mouse model of ELS, maternal separation with early weaning (MSEW), and normally-reared mice and documented shifts in diversity, abundance, and composition of microbial taxa of young mice exposed to ELS independent of any changes in microbial taxa from the dams. We conclude that exposure to ELS has a direct impact on the neonate gut microbiota that may be related to the greater risk of future disease development later in life. </p>
 
+<a href="https://zenodo.org/badge/latestdoi/319059496"><img src="https://zenodo.org/badge/319059496.svg" alt="DOI"></a>
+
 <h3>Requirements:</h3>
 <p>Some of the key R packages used in the analysis are:</p>
 <ul>
