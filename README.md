@@ -17,3 +17,7 @@ EARLY LIFE STRESS IN MICE ALTERS GUT MICROBIOTA INDEPENDENT OF MATERNAL MICROBIO
 </ul>
 <h3>Raw Data:</h3>
 <p><span>The original sequencing reads are available for download via NCBI&rsquo;s Sequence Read Archive under&nbsp;<a href="https://www.ncbi.nlm.nih.gov/bioproject/PRJNA605008" rel="nofollow">Bioproject&nbsp;<strong _ngcontent-atv-c11="" class="left">PRJNA605008</strong>.</a></span></p>
+
+<h3>Paper:</h3>
+<p><span>Early life stress in mice alters gut microbiota independent of maternal microbiota inheritance. Keri Kemp, Jackson Colson, Robin G. Lorenz, Craig L Maynard, and Jennifer S Pollock. American Journal of Physiology-Regulatory, Integrative and Comparative Physiology. <a href="https://doi.org/10.1152/ajpregu.00072.2020">2021 Mar 3. doi: 10.1152/ajpregu.00072.2020</a>
+<p><span>
